@@ -25,7 +25,7 @@ srun python -m neural_lam.train_model \
     --num_workers 2 \
     --precision bf16-mixed \
     --model graph_det \
-    --graph global_cluster_1_deg_15_refinement_4_levels \
+    --graph global_cluster_1_4_deg_15_refinement_4_levels \
     --hidden_dim 1024 \
     --hidden_dim_grid 128 \
     --hidden_dim_mesh_nodes 128 \
@@ -42,4 +42,4 @@ srun python -m neural_lam.train_model \
     --optimizer "muon_flat" \
     --eval test \
     --n_example_pred 1 \
-    --load /proj/berzelius-2022-164/users/x_erila/baltic-sea-forecasting/saved_models/train-graph_det-3x1024-09_19_08-2495/last.ckpt
+    --load /proj/berzelius-2022-164/users/x_erila/baltic-sea-forecasting/saved_models/train-graph_det-3x1024-10_07_08-7783/last.ckpt

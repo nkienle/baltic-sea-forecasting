@@ -22,7 +22,9 @@ wandb online
 
 # The training script to run is given as the first argument, any further
 # arguments are forwarded to it and override its defaults:
-#   sbatch training_scripts/train.sh training_scripts/seacast/seacast_pretrain.sh --hidden_dim 512
+#   sbatch training_scripts/train.sh training_scripts/seacast/seacast_finetune_muon.sh
+#   sbatch training_scripts/train.sh training_scripts/seacast/seacast_pretrain_soap.sh
+#   sbatch training_scripts/train.sh training_scripts/seacast/seacast_pretrain_soap_muon.sh
 # With no arguments the default below is used.
 #
 # Alternatives:

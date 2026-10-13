@@ -5,7 +5,7 @@ srun python -m neural_lam.train_model \
     --num_workers 2 \
     --precision bf16-mixed \
     --model graph_det \
-    --graph global_cluster_1_deg_15_refinement_4_levels \
+    --graph global_cluster_1_4_deg_15_refinement_4_levels \
     --hidden_dim 1024 \
     --hidden_dim_grid 128 \
     --hidden_dim_mesh_nodes 128 \
