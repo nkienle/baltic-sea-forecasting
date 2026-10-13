@@ -42,6 +42,8 @@ class ARModel(pl.LightningModule):
         self.save_hyperparameters(
             ignore=[
                 "datastore",
+                "datastore_boundary",
+                "datastore_atmosphere",
                 "statistics_datastore",
                 "statistics_datastore_boundary",
                 "statistics_datastore_atmosphere",
@@ -1141,7 +1143,9 @@ class ARModel(pl.LightningModule):
             )
 
             save_path = os.path.join(save_dir, example_name)
-            ds_examples.to_zarr(save_path, mode="w")
+            # Coordinates inherit zarr v2 codecs from the datastore, which
+            # zarr>=3 rejects when writing
+            ds_examples.drop_encoding().to_zarr(save_path, mode="w")
 
             plot_pred = pred_slice
             plot_target = target_slice

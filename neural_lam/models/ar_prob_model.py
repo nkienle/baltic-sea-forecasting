@@ -293,7 +293,7 @@ class ARProbModel(ARModel):
         }
 
         logger.info(f"Saving ensemble example to {zarr_path}")
-        ds_out.to_zarr(
+        ds_out.drop_encoding().to_zarr(
             zarr_path,
             mode="w",
             consolidated=True,
@@ -409,7 +409,7 @@ class ARProbModel(ARModel):
                 f"Initializing test-set ensemble zarr at {zarr_path} "
                 f"(first batch with {B} init_times)"
             )
-            ds_batch.to_zarr(
+            ds_batch.drop_encoding().to_zarr(
                 zarr_path, mode="w", consolidated=True, encoding=encoding
             )
         else:
@@ -417,7 +417,9 @@ class ARProbModel(ARModel):
                 f"Appending {B} init_times to test-set ensemble zarr "
                 f"at {zarr_path}"
             )
-            ds_batch.to_zarr(zarr_path, mode="a", append_dim="init_time")
+            ds_batch.drop_encoding().to_zarr(
+                zarr_path, mode="a", append_dim="init_time"
+            )
 
     def _resolve_forecasts_zarr_path(self) -> str:
         """Path of the combined test-set ensemble zarr store."""

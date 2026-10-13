@@ -796,7 +796,14 @@ def main(input_args=None):
             utils.init_training_logger_metrics(
                 training_logger, val_steps=args.val_steps_to_log
             )
-        t.fit(model=model, datamodule=data_module, ckpt_path=ckpt_path)
+        # Checkpoints store args (argparse.Namespace) and config objects,
+        # which torch>=2.6 refuses to unpickle by default
+        t.fit(
+            model=model,
+            datamodule=data_module,
+            ckpt_path=ckpt_path,
+            weights_only=False,
+        )
         return last_ckpt_callback.last_model_path
 
     def _completed_epochs(ckpt_path):
@@ -937,6 +944,7 @@ def main(input_args=None):
             model=model,
             datamodule=data_module,
             ckpt_path=args.load,
+            weights_only=False,
         )
 
     elif args.scheduler == "pretrain":
@@ -1150,7 +1158,12 @@ def main(input_args=None):
             utils.init_training_logger_metrics(
                 training_logger, val_steps=args.val_steps_to_log
             )
-        trainer.fit(model=model, datamodule=data_module, ckpt_path=args.load)
+        trainer.fit(
+            model=model,
+            datamodule=data_module,
+            ckpt_path=args.load,
+            weights_only=False,
+        )
 
 
 if __name__ == "__main__":
