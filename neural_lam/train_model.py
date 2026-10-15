@@ -1,4 +1,5 @@
 # Standard library
+import inspect
 import json
 import random
 import time
@@ -6,6 +7,7 @@ from argparse import ArgumentParser
 
 # Third-party
 # for logging the model:
+import numpy as np
 import pytorch_lightning as pl
 import torch
 from lightning_fabric.utilities import seed
@@ -14,7 +16,18 @@ from loguru import logger
 # Local
 from . import utils
 from .config import load_config_and_datastores
-from .models import EDM, FM, SI, GraphCast, GraphCRPS, GraphEFM, GraphFM, GraphDET
+from .models import (
+    EDM,
+    FM,
+    SI,
+    FlowMap,
+    GraphCast,
+    GraphCRPS,
+    GraphDET,
+    GraphEFM,
+    GraphFM,
+)
+from .models.flow_map import add_flow_map_args
 from .weather_dataset import WeatherDataModule
 
 MODELS = {
@@ -26,7 +39,36 @@ MODELS = {
     "EDM": EDM,
     "FM": FM,
     "SI": SI,
+    "FlowMap": FlowMap,
 }
+
+# Flow map training is split in parts, each launched as its own run (with
+# --load pointing to the previous part), see the flow_map_* schedulers below:
+# part name -> (objective, unroll steps (None = --ar_steps_train),
+#               default warmup epochs)
+FLOW_MAP_SCHEDULERS = {
+    "flow_map_pretrain": ("map", 1, 1),
+    "flow_map_finetune": ("map", 1, 5),
+    "flow_map_crps": (None, None, 2),
+}
+
+
+# Checkpoints store args (argparse.Namespace) and config objects, which
+# torch>=2.6 refuses to unpickle by default. Lightning >= 2.6 takes
+# weights_only in fit/test; older versions (e.g. 2.5 in the Berzelius bsf
+# env) do not accept the argument and load with weights_only=False.
+_CKPT_LOAD_KWARGS = (
+    {"weights_only": False}
+    if "weights_only" in inspect.signature(pl.Trainer.fit).parameters
+    else {}
+)
+
+
+def _limit_batches(value):
+    """--limit_*_batches for pl.Trainer: None (all), a fraction or a count"""
+    if value is None:
+        return None
+    return int(value) if value > 1 else float(value)
 
 
 @logger.catch
@@ -435,6 +477,41 @@ def main(input_args=None):
         "single-step phases. It is already enabled automatically whenever "
         "more than one step is unrolled (default: False)",
     )
+    parser.add_argument(
+        "--limit_train_batches",
+        type=float,
+        default=None,
+        help="Limit the training batches per epoch: a fraction (<= 1.0) or a "
+        "number of batches (> 1), e.g. for smoke tests (default: all)",
+    )
+    parser.add_argument(
+        "--limit_val_batches",
+        type=float,
+        default=None,
+        help="Limit the validation batches, as --limit_train_batches "
+        "(default: all)",
+    )
+    parser.add_argument(
+        "--grad_clip",
+        type=float,
+        default=None,
+        help="Clip gradients to this global norm (default: None, no clipping)",
+    )
+    parser.add_argument(
+        "--warmup_epochs",
+        type=int,
+        default=None,
+        help="Linear LR warmup epochs of the flow_map_* schedulers "
+        "(default: 1 for flow_map_pretrain, 5 for flow_map_finetune, 2 for "
+        "flow_map_crps)",
+    )
+    parser.add_argument(
+        "--adaln_zero",
+        action="store_true",
+        help="GraphDiff backbone: use LN(x) * (1 + scale(emb)) + shift(emb) "
+        "with zero-initialised scale/shift in all conditional layer norms, "
+        "instead of LN(x) * scale(emb) + shift(emb) (default: False)",
+    )
 
     # Evaluation options
     parser.add_argument(
@@ -617,9 +694,18 @@ def main(input_args=None):
             "probabilistic",
             "deterministic",
             "finetune_deterministic",
+            *FLOW_MAP_SCHEDULERS,
         ],
-        help="Multi-phase training scheduler.",
+        help="Multi-phase training scheduler. flow_map_pretrain (1 deg, "
+        "ar=1, flow-map loss), flow_map_finetune (0.25 deg, ar=1, flow-map "
+        "loss) and flow_map_crps (ar=--ar_steps_train, CRPS of 1-jump "
+        "rollouts, --fmap_objective crps or map+crps) are the three parts "
+        "of the FlowMap schedule, each its own run with --load set to the "
+        "checkpoint of the previous part. --epochs is the length of the "
+        "part. Re-running a part with --load set to its own checkpoint "
+        "resumes or extends it (to --epochs in total).",
     )
+    add_flow_map_args(parser)
 
     args = parser.parse_args(input_args)
     args.var_leads_metrics_watch = {
@@ -778,6 +864,10 @@ def main(input_args=None):
             callbacks=cbs,
             check_val_every_n_epoch=args.val_interval,
             precision=args.precision,
+            gradient_clip_val=args.grad_clip,
+            gradient_clip_algorithm="norm",
+            limit_train_batches=_limit_batches(args.limit_train_batches),
+            limit_val_batches=_limit_batches(args.limit_val_batches),
             num_sanity_val_steps=args.num_sanity_val_steps,
         )
 
@@ -802,7 +892,7 @@ def main(input_args=None):
             model=model,
             datamodule=data_module,
             ckpt_path=ckpt_path,
-            weights_only=False,
+            **_CKPT_LOAD_KWARGS,
         )
         return last_ckpt_callback.last_model_path
 
@@ -944,7 +1034,7 @@ def main(input_args=None):
             model=model,
             datamodule=data_module,
             ckpt_path=args.load,
-            weights_only=False,
+            **_CKPT_LOAD_KWARGS,
         )
 
     elif args.scheduler == "pretrain":
@@ -1147,6 +1237,119 @@ def main(input_args=None):
             ]
         )
 
+    elif args.scheduler in FLOW_MAP_SCHEDULERS:
+        assert args.model == "FlowMap", (
+            f"--scheduler {args.scheduler} is for --model FlowMap"
+        )
+        objective, ar_steps, default_warmup = FLOW_MAP_SCHEDULERS[
+            args.scheduler
+        ]
+        if objective is None:
+            # The CRPS part: crps or map+crps (map+crps unless given)
+            objective = (
+                args.fmap_objective
+                if args.fmap_objective in ("crps", "map+crps")
+                else "map+crps"
+            )
+        if ar_steps is None:
+            ar_steps = args.ar_steps_train if args.ar_steps_train > 1 else 2
+        warmup_epochs = (
+            default_warmup if args.warmup_epochs is None else args.warmup_epochs
+        )
+
+        # Where this part starts. --load is a checkpoint either of the
+        # previous part (start a new part after its last epoch) or of this
+        # part itself (resume/extend it, keeping the optimizer state).
+        start_epoch, same_part = 0, False
+        if args.load:
+            ckpt = torch.load(
+                args.load, map_location="cpu", mmap=True, weights_only=False
+            )
+            loaded_args = ckpt.get("hyper_parameters", {}).get("args")
+            same_part = (
+                getattr(loaded_args, "scheduler", None) == args.scheduler
+            )
+            done = _completed_epochs(args.load)
+            if same_part:
+                start_epoch = ckpt.get("fmap_stage_start_epoch", 0)
+            else:
+                start_epoch = done
+            del ckpt
+            print(
+                f"[{args.scheduler}] --load {args.load}: "
+                + (
+                    f"resuming this part (started at epoch {start_epoch}, "
+                    f"{done - start_epoch} epoch(s) done)"
+                    if same_part
+                    else f"starting a new part after epoch {done}"
+                )
+            )
+            # Keep the optimizer and LR schedule only within a part
+            model.restore_opt = same_part
+            if same_part and not args.restore_opt:
+                print(
+                    f"[{args.scheduler}] restoring the optimizer state "
+                    "(same part)"
+                )
+        max_epochs = start_epoch + args.epochs
+
+        model.fmap_objective = objective
+        model.fmap_stage_start_epoch = start_epoch
+        # A new part restarts the EMA (new resolution or objective)
+        model.fmap_reset_ema_on_train_start = not same_part
+        _set_ar_steps(ar_steps)
+
+        # Per-epoch LR: linear warmup, then cosine from --lr to --min_lr
+        # over the --epochs of this part. The lambda is rebuilt from the
+        # current --epochs, so extending a part re-stretches the cosine (the
+        # epoch count is restored with the scheduler state).
+        part_epochs = args.epochs
+        lr_floor = min(args.min_lr / args.lr, 1.0)
+
+        def _lr_factor(epoch):
+            warm = min(1.0, (epoch + 1) / warmup_epochs) if warmup_epochs else 1
+            progress = min(epoch / max(part_epochs, 1), 1.0)
+            cosine = 0.5 * (1 + np.cos(np.pi * progress))
+            return warm * (lr_floor + (1 - lr_floor) * cosine)
+
+        _orig_configure = model.configure_optimizers
+
+        def configure_optimizers_flow_map(self_ref=model):
+            opt = _orig_configure()
+            optimizer = opt["optimizer"] if isinstance(opt, dict) else opt
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = args.lr
+                param_group["initial_lr"] = args.lr
+            sched = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_factor)
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {"scheduler": sched, "interval": "epoch"},
+            }
+
+        model.configure_optimizers = configure_optimizers_flow_map
+        if same_part:
+            print(
+                f"[{args.scheduler}] NOTE: the cosine LR runs over the "
+                f"current --epochs {part_epochs}; if this is larger than in "
+                "the earlier run of the part, the remaining schedule is "
+                "re-stretched"
+            )
+
+        # The learned loss weight is unused with the pure CRPS objective
+        strategy = (
+            "ddp_find_unused_parameters_true"
+            if objective == "crps"
+            else "ddp"
+        )
+        print(
+            f"[{args.scheduler}] epochs {start_epoch} -> {max_epochs}, "
+            f"objective {objective}, ar_steps_train {ar_steps}, "
+            f"lr {args.lr} -> {args.min_lr}, warmup {warmup_epochs} epochs"
+        )
+        _run_phase(
+            model, data_module, max_epochs, strategy, ckpt_path=args.load
+        )
+
     else:
         # Default: single-phase training
         strategy = (
@@ -1162,7 +1365,7 @@ def main(input_args=None):
             model=model,
             datamodule=data_module,
             ckpt_path=args.load,
-            weights_only=False,
+            **_CKPT_LOAD_KWARGS,
         )
 
 

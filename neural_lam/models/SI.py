@@ -180,7 +180,8 @@ class SI(EDM):
         # TODO: Experiment with this later
         next_state = self.EM(diffusion_fn=None, **EM_args)
 
-        return next_state
+        # No predicted std.-dev. (ARModel.unroll_prediction contract)
+        return next_state, None
 
     # TODO: Should support going from pure noise to the reference
     # distribution to compare with diffusion.

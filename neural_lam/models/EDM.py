@@ -167,7 +167,8 @@ class EDM(ARProbModel):
             ) + self.diff_mean  # Unormalize residual
             next_state = prev_state + next_state
 
-        return next_state
+        # No predicted std.-dev. (ARModel.unroll_prediction contract)
+        return next_state, None
 
     def test_step(self, batch, batch_idx):
         """

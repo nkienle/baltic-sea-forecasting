@@ -25,6 +25,8 @@ wandb online
 #   sbatch training_scripts/train.sh training_scripts/seacast/seacast_finetune_muon.sh
 #   sbatch training_scripts/train.sh training_scripts/seacast/seacast_pretrain_soap.sh
 #   sbatch training_scripts/train.sh training_scripts/seacast/seacast_pretrain_soap_muon.sh
+#   sbatch training_scripts/train.sh training_scripts/graph_flow_map/flow_map_pretrain.sh
+#   sbatch training_scripts/train.sh training_scripts/graph_flow/fm_positional.sh
 # With no arguments the default below is used.
 #
 # Alternatives:

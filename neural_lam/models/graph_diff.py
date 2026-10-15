@@ -144,12 +144,36 @@ class GraphDiff(ARModel):
                 hidden_dim=self.noise_level_dim,
                 output_dim=self.noise_level_dim,
             )
+        elif args.noise_embedding == "positional":
+            self.noise_dim = 16
+            self.map_noise = PositionalNoiseEmbedding(
+                num_frequencies=args.hidden_dim * self.channel_mult_noise,
+                hidden_dim=self.noise_level_dim,
+                output_dim=self.noise_level_dim,
+            )
         else:
             self.noise_dim = 16
             self.map_noise = NoiseEmbedding(
                 num_frequencies=args.hidden_dim * self.channel_mult_noise,
                 hidden_dim=self.noise_level_dim,
                 output_dim=self.noise_level_dim,
+            )
+
+        # Flow maps X_{s,t} take a second time: s goes through map_noise and
+        # the step dt = t - s through map_dt, added to the time features
+        # before the noise MLP. map_dt is zero-initialised, so a flow map
+        # loaded from a flow matching (FM) checkpoint starts as the FM
+        # velocity (one Euler step of the teacher).
+        self.map_dt = None
+        if args.model == "FlowMap":
+            assert args.noise_embedding != "linear", (
+                "FlowMap needs a time embedding (--noise_embedding "
+                "positional or fourier)"
+            )
+            self.map_dt = DtEmbedding(
+                num_channels=args.hidden_dim * self.channel_mult_noise,
+                embedding_type=getattr(args, "fmap_dt_embedding", None)
+                or "positional",
             )
 
         self.interior_embedder = make_mlp(
@@ -398,6 +422,9 @@ class GraphDiff(ARModel):
                 ]
             )
 
+        if getattr(args, "adaln_zero", False):
+            utils.set_adaln_zero(self)
+
     # ----------------------------------------------------------------------------
     @property
     def num_grid_connected_mesh_nodes(self):
@@ -410,16 +437,28 @@ class GraphDiff(ARModel):
         return self.mesh_static_features.shape[0]
 
     def forward(
-        self, x, noise_level, cond, boundary_forcing, atmosphere_forcing
+        self,
+        x,
+        noise_level,
+        cond,
+        boundary_forcing,
+        atmosphere_forcing,
+        dt=None,
     ):
         """
         Forward pass through the model
         x: (B, num_grid_nodes, feature_dim)
-        noise_level: (B, num_grid_nodes, feature_dim)
+        noise_level: (B,) noise level / time, or (B, noise_dim) noise vector
+            for the linear embedding
         cond: (B, num_grid_nodes, feature_dim)
+        dt: (B,), flow map step t - s, only for models built with map_dt
         """
         # Mapping.
-        emb = self.map_noise(noise_level).unsqueeze(1).expand(x.shape[0], 1, -1)
+        if dt is None:
+            emb = self.map_noise(noise_level)
+        else:
+            emb = self.map_noise(noise_level, extra=self.map_dt(dt))
+        emb = emb.unsqueeze(1).expand(x.shape[0], 1, -1)
         prediction = self.predict_step(
             x, emb, cond, boundary_forcing, atmosphere_forcing
         )
@@ -902,6 +941,54 @@ class FourierEmbedding(torch.nn.Module):
         return x
 
 
+class PositionalEmbedding(nn.Module):
+    """
+    Sinusoidal embedding with log-spaced frequencies <= 1 (EDM / DDPM++).
+    Smooth in its input, unlike FourierEmbedding with scale 16, which matters
+    when the network is differentiated in time (flow maps).
+    """
+
+    def __init__(self, num_channels, max_positions=10000, endpoint=False):
+        super().__init__()
+        self.num_channels = num_channels
+        self.max_positions = max_positions
+        self.endpoint = endpoint
+
+    def forward(self, x):
+        freqs = torch.arange(
+            start=0,
+            end=self.num_channels // 2,
+            dtype=torch.float32,
+            device=x.device,
+        )
+        freqs = freqs / (self.num_channels // 2 - (1 if self.endpoint else 0))
+        freqs = (1 / self.max_positions) ** freqs
+        x = x.ger(freqs.to(x.dtype))
+        x = torch.cat([x.cos(), x.sin()], dim=1)
+        return x
+
+
+class DtEmbedding(nn.Module):
+    """
+    Embedding of the flow map step dt = t - s, (B,) -> (B, num_channels),
+    added to the time features before the noise MLP. The output projection
+    is zero-initialised, so the embedding is zero at initialisation.
+    """
+
+    def __init__(self, num_channels, embedding_type="positional"):
+        super().__init__()
+        if embedding_type == "positional":
+            self.embed = PositionalEmbedding(num_channels, endpoint=True)
+        else:
+            self.embed = FourierEmbedding(num_channels)
+        self.proj = nn.Linear(num_channels, num_channels)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, dt):
+        return self.proj(self.embed(dt))
+
+
 class NoiseLevelMLP(nn.Module):
     def __init__(self, input_dim, hidden_dim=128, output_dim=16):
         super(NoiseLevelMLP, self).__init__()
@@ -930,7 +1017,11 @@ class NoiseEmbedding(nn.Module):
             hidden_dim=hidden_dim,
         )
 
-    def forward(self, log_noise_levels):
+    def forward(self, log_noise_levels, extra=None):
+        """
+        log_noise_levels: (B,)
+        extra: (B, num_frequencies), optional features added before the MLP
+        """
         fourier_features = self.fourier_transform(log_noise_levels)
         fourier_features = (
             fourier_features.reshape(fourier_features.shape[0], 2, -1)
@@ -938,5 +1029,30 @@ class NoiseEmbedding(nn.Module):
             .reshape(*fourier_features.shape)
             .contiguous()
         )  # swap sin/cos
+        if extra is not None:
+            fourier_features = fourier_features + extra
         noise_level_encoding = self.mlp(fourier_features)
         return noise_level_encoding
+
+
+class PositionalNoiseEmbedding(nn.Module):
+    def __init__(self, num_frequencies=32, output_dim=16, hidden_dim=128):
+        super().__init__()
+        self.positional_transform = PositionalEmbedding(
+            num_channels=num_frequencies
+        )
+        self.mlp = NoiseLevelMLP(
+            input_dim=num_frequencies,
+            output_dim=output_dim,
+            hidden_dim=hidden_dim,
+        )
+
+    def forward(self, noise_levels, extra=None):
+        """
+        noise_levels: (B,)
+        extra: (B, num_frequencies), optional features added before the MLP
+        """
+        features = self.positional_transform(noise_levels)
+        if extra is not None:
+            features = features + extra
+        return self.mlp(features)

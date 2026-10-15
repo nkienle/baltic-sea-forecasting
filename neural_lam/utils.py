@@ -311,6 +311,8 @@ class ConditionalLayerNorm(nn.Module):
         )
         self.scale_layer = nn.Linear(cond_dim, normalized_shape)
         self.offset_layer = nn.Linear(cond_dim, normalized_shape)
+        # adaLN-zero parametrization, see set_adaln_zero
+        self.adaln_zero = False
 
     def forward(self, x, emb):
         """
@@ -319,7 +321,30 @@ class ConditionalLayerNorm(nn.Module):
         """
         scale = self.scale_layer(emb)  # (..., normalized_shape)
         offset = self.offset_layer(emb)  # (..., normalized_shape)
+        if self.adaln_zero:
+            scale = 1.0 + scale
         return self.layer_norm(x) * scale + offset
+
+
+def set_adaln_zero(module, init=True):
+    """
+    Switch every ConditionalLayerNorm in module to the adaLN-zero
+    parametrization LN(x) * (1 + scale(emb)) + offset(emb).
+
+    With init=True the scale and offset layers are zero-initialised, so that
+    each conditional layer norm starts as a plain (unit-scale) LayerNorm,
+    independent of the conditioning. Pass init=False when the weights are
+    loaded afterwards anyway. The parameters keep their names and shapes, so
+    checkpoints have the same layout with and without the flag.
+    """
+    for m in module.modules():
+        if isinstance(m, ConditionalLayerNorm):
+            m.adaln_zero = True
+            if init:
+                for layer in (m.scale_layer, m.offset_layer):
+                    nn.init.zeros_(layer.weight)
+                    nn.init.zeros_(layer.bias)
+    return module
 
 
 def _mlp_layers(blueprint):
