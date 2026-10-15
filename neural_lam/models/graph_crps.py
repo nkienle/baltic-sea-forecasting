@@ -27,6 +27,8 @@ class GraphCRPS(ARProbModel):
     previous state and clamped to the valid range.
     """
 
+    supports_distr_crps = True
+
     def __init__(
         self,
         args,
@@ -158,25 +160,35 @@ class GraphCRPS(ARProbModel):
             _,
         ) = batch
 
+        # NOTE: We always use ensemble size 2 for training (following FGN)
         trajectories = self.sample_trajectories(
             init_states,
             forcing,
             boundary_forcing,
             atmosphere_forcing,
-            ensemble_size=2,
+            ensemble_size=1 if self.train_distr_crps else 2,
         )
 
-        crps_batch = metrics.afcrps_ens(
-            trajectories,
-            target_states,
-            None,
-            average_grid=False,
-            sum_vars=False,
-            alpha=self.args.crps_alpha,
-        )  # (B, pred_steps, d_f)
-        # prediction: (B, pred_steps, num_interior_nodes, d_f)
-        # pred_std: (B, pred_steps, num_interior_nodes, d_f) or (d_f,)
-        # loss_batch: (B, pred_steps)
+        if self.train_distr_crps:
+            # CRPS computed across one member per device
+            pred_forecast = trajectories[:, 0]  # Extract single forecast
+            crps_batch = self.compute_distributed_crps(
+                pred_forecast, target_states
+            )
+        else:
+            # CRPS computed across multiple members on same device
+            crps_batch = metrics.afcrps_ens(
+                trajectories,
+                target_states,
+                None,
+                average_grid=False,
+                sum_vars=False,
+                alpha=self.args.crps_alpha,
+            )  # (B, pred_steps, d_f)
+            # prediction: (B, pred_steps, num_interior_nodes, d_f)
+            # pred_std: (B, pred_steps, num_interior_nodes, d_f) or (d_f,)
+            # loss_batch: (B, pred_steps)
+
         loss_batch = metrics.mask_and_reduce_metric(
             crps_batch / self.per_var_std,
             mask=self.loss_mask,

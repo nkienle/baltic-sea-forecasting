@@ -1014,6 +1014,77 @@ class WeatherDataset(torch.utils.data.Dataset):
         return da
 
 
+class PairedDistributedSampler(torch.utils.data.Sampler):
+    """
+    Pairs up ranks: (0,1), (2,3), (4,5), ...
+    Both ranks in a pair see the same sample.
+    Different pairs see different samples (standard partitioning across
+    pairs).
+    """
+
+    def __init__(self, dataset, pair_size=2, num_replicas=None, rank=None,
+                 shuffle=True, seed=0, drop_last=False):
+        if num_replicas is None:
+            num_replicas = torch.distributed.get_world_size()
+        if rank is None:
+            rank = torch.distributed.get_rank()
+
+        assert num_replicas % pair_size == 0, \
+            f"world_size ({num_replicas}) must be divisible by " \
+            f"pair_size ({pair_size})"
+
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.pair_size = pair_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        self.drop_last = drop_last
+
+        # Which logical group this rank belongs to, and how many groups
+        self.group_id = rank // pair_size
+        self.num_groups = num_replicas // pair_size
+
+        # Pad dataset length so it's evenly divisible by num_groups
+        if self.drop_last:
+            self.num_samples = len(dataset) // self.num_groups
+        else:
+            self.num_samples = (
+                (len(dataset) + self.num_groups - 1) // self.num_groups
+            )
+        self.total_size = self.num_samples * self.num_groups
+
+    def __iter__(self):
+        # Deterministic shuffle - identical on every rank
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            indices = torch.randperm(len(self.dataset), generator=g).tolist()
+        else:
+            indices = list(range(len(self.dataset)))
+
+        # Pad to total_size (same logic as DistributedSampler)
+        if not self.drop_last:
+            padding = self.total_size - len(indices)
+            indices += indices[:padding]
+        else:
+            indices = indices[:self.total_size]
+
+        # Partition across groups (not individual ranks)
+        # group_id slices exactly like DistributedSampler slices by rank
+        indices = indices[self.group_id::self.num_groups]
+
+        assert len(indices) == self.num_samples
+        return iter(indices)
+
+    def __len__(self):
+        return self.num_samples
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+
 class WeatherDataModule(pl.LightningDataModule):
     """DataModule for weather data."""
 
@@ -1042,6 +1113,7 @@ class WeatherDataModule(pl.LightningDataModule):
         statistics_datastore: BaseDatastore = None,
         statistics_datastore_boundary: BaseDatastore = None,
         statistics_datastore_atmosphere: BaseDatastore = None,
+        train_distr_crps=False,
     ):
         super().__init__()
         self._datastore = datastore
@@ -1070,6 +1142,7 @@ class WeatherDataModule(pl.LightningDataModule):
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
+        self.train_distr_crps = train_distr_crps
         if num_workers > 0:
             # default to spawn for now, as the default on linux "fork" hangs
             # when using dask
@@ -1152,15 +1225,26 @@ class WeatherDataModule(pl.LightningDataModule):
                 **stats_kwargs,
             )
 
+    def _make_sampler(self, dataset, shuffle=True, seed=0):
+        """
+        Determine sampler to use (samples indices from dataset for each rank)
+        based on if train_distr_crps is set or not.
+        """
+        if self.train_distr_crps:
+            return PairedDistributedSampler(dataset, shuffle=shuffle, seed=seed)
+        else:
+            return None
+
     def train_dataloader(self):
         """Load train dataset."""
         return torch.utils.data.DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            shuffle=True,
+            shuffle=None if self.train_distr_crps else True,
             multiprocessing_context=self.multiprocessing_context,
             persistent_workers=True,
+            sampler=self._make_sampler(self.train_dataset, shuffle=True),
         )
 
     def val_dataloader(self):

@@ -6,6 +6,7 @@ from typing import Union
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.distributed as dist
 import wandb
 import xarray as xr
 from loguru import logger
@@ -27,6 +28,10 @@ class ARProbModel(ARModel):
     # pylint: disable=arguments-differ
     # Disable to override args/kwargs from superclass
 
+    # Only models that actually know how to use a distributed CRPS loss should set 
+    # this True, to prevent erroneous use of custom sampler.
+    supports_distr_crps = False
+
     def __init__(
         self,
         args,
@@ -46,6 +51,11 @@ class ARProbModel(ARModel):
         )
 
         self.ensemble_size = args.ensemble_size
+        self.train_distr_crps = args.train_distr_crps
+        if self.train_distr_crps and not self.supports_distr_crps:
+            raise ValueError(
+                f"{type(self).__name__} does not support train_distr_crps."
+            )
 
         # Per-rank RNG for reproducible but distinct noise across DDP ranks.
         self._rank = self._get_rank()
@@ -72,6 +82,30 @@ class ARProbModel(ARModel):
             }
         )
 
+    def on_train_epoch_start(self):
+        # With the pairwise sampler Lightning does not automatically set the
+        # epoch for the sampler, so we do it here.
+        if self.train_distr_crps:
+            self.trainer.train_dataloader.sampler.set_epoch(self.current_epoch)
+
+    def setup(self, stage=None):
+        if self.train_distr_crps:
+            # Set up process groups here
+            # All ranks must create all groups, following docs
+            rank = self.global_rank
+            ws = self.trainer.world_size
+
+            # Check that number of GPUs is even (implicitly > 1)
+            if ws % 2 != 0:
+                raise ValueError(
+                    "Can not use train_distr_crps with odd number of GPUs."
+                )
+
+            self.pair_groups = [
+                dist.new_group((i, i + 1)) for i in range(0, ws, 2)
+            ]
+            self.my_pair_group = self.pair_groups[rank // 2]
+
     def _get_rank(self) -> int:
         """Current process rank (0 if not distributed) used for per-rank RNG."""
         if (
@@ -91,6 +125,60 @@ class ARProbModel(ARModel):
                 device=device
             ).manual_seed(self.args.seed + self._rank)
         return self._rng_generators[device]
+
+    def _pair_reduce_with_local_grad(self, tensor):
+        """
+        Perform an all-reduce across 2 GPUs, but use the local copy of the
+        tensor (still attached to comp. graph), to be able to get gradients.
+        """
+        rec_list = [torch.zeros_like(tensor) for _ in range(2)]
+        dist.all_gather(rec_list, tensor, group=self.my_pair_group)
+        # Get the tensor from other GPU
+        other_rank_idx = (self.global_rank + 1) % 2  # even rank: 1, odd rank: 0
+        rec_tensor = rec_list[other_rank_idx]
+
+        # Sum with original tensor, still connected to comp. graph
+        return tensor + rec_tensor
+
+    def compute_distributed_crps(self, forecast, target):
+        """
+        Compute CRPS using ensemble members distributed across multiple GPUs.
+        NOTE: Now implemented only for 2 ensemble members, but this could
+        be generalized.
+
+        forecast: (B, pred_steps, num_interior_nodes, d_f)
+        target: (B, pred_steps, num_interior_nodes, d_f)
+
+        Returns entry_crps: (B, pred_steps, num_interior_nodes, d_f)
+        """
+        ae_of_member = torch.abs(forecast - target)
+        # (B, pred_steps, num_interior_nodes, d_f)
+
+        if self.global_rank % 2 == 0:
+            # Even rank, positive sign for forecast, send to rank+1
+            fc_for_spread = forecast
+        else:
+            # Odd rank, negative sign for forecast, send to rank-1
+            fc_for_spread = -1. * forecast
+
+        # Pairwise distributed communication
+        # For Abs. error, average across 2 GPUs/members
+        mae_term = 0.5 * self._pair_reduce_with_local_grad(ae_of_member)
+
+        # For spread, sum across 2 GPUs/members, with negative sign in odd
+        # rank turning this to a difference
+        fc_diff = self._pair_reduce_with_local_grad(fc_for_spread)
+        spread_term = -0.25 * (1 + self.args.crps_alpha) * torch.abs(fc_diff)
+
+        entry_crps = mae_term + spread_term
+        # (B, pred_steps, num_interior_nodes, d_f)
+
+        # Gradients are not propagated through distributed operations, so they
+        # are computed per GPU. We can still get correct gradients by
+        # computing CRPS on each GPU and backpropagating locally. We need to
+        # compensate with a factor 2, as the CRPS loss is averaged across the
+        # 2 GPUs.
+        return 2 * entry_crps
 
     def sample_trajectories(
         self,
