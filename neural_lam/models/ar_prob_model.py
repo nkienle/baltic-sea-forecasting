@@ -82,6 +82,18 @@ class ARProbModel(ARModel):
             }
         )
 
+    def on_fit_start(self):
+        super().on_fit_start()
+        # A different global RNG stream on every rank. Noise drawn with the
+        # global RNG would otherwise be identical on all ranks, which all
+        # start from the same --seed (seed_everything), so e.g. the two
+        # members of a --train_distr_crps pair would coincide. The global RNG
+        # (rather than a per-rank torch.Generator) is what gradient
+        # checkpointing restores for the recomputation.
+        trainer = self._trainer
+        if trainer is not None and trainer.world_size > 1:
+            torch.manual_seed(int(self.args.seed) + trainer.global_rank)
+
     def on_train_epoch_start(self):
         # With the pairwise sampler Lightning does not automatically set the
         # epoch for the sampler, so we do it here.
@@ -119,6 +131,12 @@ class ARProbModel(ARModel):
         """
         Per-rank Generator for noise sampling. Seeded with args.seed + rank so
         each DDP rank has a different but reproducible stream.
+
+        NOTE: Do not draw noise from this inside a gradient-checkpointed
+        rollout step (training with ar_steps_train > 1 or
+        --grad_checkpointing): checkpointing only restores the global RNG, so
+        the recomputation would see different noise. Use the global RNG
+        there, which on_fit_start makes rank-dependent.
         """
         if device not in self._rng_generators:
             self._rng_generators[device] = torch.Generator(

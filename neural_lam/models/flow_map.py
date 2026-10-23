@@ -447,15 +447,6 @@ class FlowMapMixin:
             p.copy_(b)
         self._ema_backup = None
 
-    def on_fit_start(self):
-        super().on_fit_start()
-        # A different global RNG stream on every rank: noise drawn with the
-        # global RNG (e.g. under gradient checkpointing) would otherwise be
-        # identical on all ranks, which all start from the same --seed
-        trainer = self._trainer
-        if trainer is not None and trainer.world_size > 1:
-            torch.manual_seed(int(self.args.seed) + trainer.global_rank)
-
     @contextlib.contextmanager
     def dropout_off(self):
         """Backbone dropout off for the off-diagonal terms (as the reference

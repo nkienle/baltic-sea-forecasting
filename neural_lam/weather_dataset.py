@@ -1114,6 +1114,7 @@ class WeatherDataModule(pl.LightningDataModule):
         statistics_datastore_boundary: BaseDatastore = None,
         statistics_datastore_atmosphere: BaseDatastore = None,
         train_distr_crps=False,
+        seed=0,
     ):
         super().__init__()
         self._datastore = datastore
@@ -1143,6 +1144,8 @@ class WeatherDataModule(pl.LightningDataModule):
         self.val_dataset = None
         self.test_dataset = None
         self.train_distr_crps = train_distr_crps
+        # Seed of the paired (train_distr_crps) training sampler shuffle
+        self.seed = seed
         if num_workers > 0:
             # default to spawn for now, as the default on linux "fork" hangs
             # when using dask
@@ -1225,15 +1228,33 @@ class WeatherDataModule(pl.LightningDataModule):
                 **stats_kwargs,
             )
 
-    def _make_sampler(self, dataset, shuffle=True, seed=0):
+    def _make_sampler(self, dataset, shuffle=True):
         """
         Determine sampler to use (samples indices from dataset for each rank)
         based on if train_distr_crps is set or not.
         """
         if self.train_distr_crps:
-            return PairedDistributedSampler(dataset, shuffle=shuffle, seed=seed)
+            return PairedDistributedSampler(
+                dataset, shuffle=shuffle, seed=self.seed
+            )
         else:
             return None
+
+    def _make_eval_sampler(self, dataset):
+        """
+        With train_distr_crps, Lightning's automatic distributed sampler is
+        off (use_distributed_sampler=False), also for val/test. Without this
+        every rank would then evaluate the full val/test set. Use the same
+        partitioning across ranks as Lightning does (DistributedSampler
+        without shuffling).
+        """
+        if (
+            self.train_distr_crps
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            return torch.utils.data.DistributedSampler(dataset, shuffle=False)
+        return None
 
     def train_dataloader(self):
         """Load train dataset."""
@@ -1256,6 +1277,7 @@ class WeatherDataModule(pl.LightningDataModule):
             shuffle=False,
             multiprocessing_context=self.multiprocessing_context,
             persistent_workers=True,
+            sampler=self._make_eval_sampler(self.val_dataset),
         )
 
     def test_dataloader(self):
@@ -1267,4 +1289,5 @@ class WeatherDataModule(pl.LightningDataModule):
             shuffle=False,
             multiprocessing_context=self.multiprocessing_context,
             persistent_workers=True,
+            sampler=self._make_eval_sampler(self.test_dataset),
         )

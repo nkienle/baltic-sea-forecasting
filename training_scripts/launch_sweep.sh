@@ -30,16 +30,28 @@ RUNS=(
 # Build a short job name from the run flags. This ends up in the log file name
 # via the %x in the --output of train.sh, so keep it short and plain.
 make_tag() {
-    local tokens=($1) hidden_dim graph i
+    local tokens=($1) hidden_dim graph stoch="" i j
     for ((i = 0; i < ${#tokens[@]}; i++)); do
         case "${tokens[i]}" in
             --hidden_dim) hidden_dim="${tokens[i + 1]}" ;;
             --graph) graph="${tokens[i + 1]}" ;;
+            --stochasticity)
+                # graph_crps runs: name them by their sources, e.g. crps_fgn_mc
+                stoch="crps"
+                for ((j = i + 1; j < ${#tokens[@]}; j++)); do
+                    [[ "${tokens[j]}" == --* ]] && break
+                    stoch="${stoch}_${tokens[j]}"
+                done
+                ;;
         esac
     done
+    if [ -n "$stoch" ] && [ -z "$hidden_dim$graph" ]; then
+        echo "$stoch"
+        return
+    fi
     graph="${graph#global_cluster_}"
     graph="${graph%_refinement_*}"
-    echo "h${hidden_dim}_${graph}"
+    echo "h${hidden_dim}_${graph}${stoch:+_$stoch}"
 }
 
 for run in "${RUNS[@]}"; do

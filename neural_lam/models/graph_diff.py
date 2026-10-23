@@ -425,6 +425,68 @@ class GraphDiff(ARModel):
         if getattr(args, "adaln_zero", False):
             utils.set_adaln_zero(self)
 
+        # Stochastic level noise (SDL), only added by GraphCRPS, see
+        # add_level_noise
+        self.sdl = None
+        self.sdl_points = None
+        # Multiplier of the SDL noise, ramped from 0 to 1 by GraphCRPS at the
+        # start of CRPS fine-tuning (0 = no noise drawn at all)
+        self.sdl_scale = 1.0
+
+    def add_level_noise(self, args):
+        """
+        Add stochastic decomposition layers (SDL, Schreck et al. 2025,
+        arXiv:2512.18815) on the mesh levels: each perturbs the node
+        representations of one level with i.i.d. per-node Gaussian noise,
+        scaled per channel from an independent latent vector (see
+        StochasticLevelNoise).
+
+        --sdl_points down: inject after the down-GNN of each level in every
+            processor down sweep (and at the top level before its same-level
+            GNN), the graph analogue of the paper's injection after each
+            decoder upsampling. One SDL per processor layer and level.
+        --sdl_points init: inject once per level, after mesh init.
+        --sdl_levels: the mesh levels to inject at (default: all).
+        Non-hierarchical graphs get one SDL on the mesh before the processor.
+        """
+        num_levels = self.num_levels if self.hierarchical else 1
+        levels = getattr(args, "sdl_levels", None)
+        levels = list(range(num_levels)) if levels is None else list(levels)
+        assert levels and all(0 <= lvl < num_levels for lvl in levels), (
+            f"--sdl_levels {levels} not in the {num_levels} mesh levels"
+        )
+
+        def make_level_noises():
+            return nn.ModuleDict(
+                {
+                    str(lvl): StochasticLevelNoise(
+                        args.hidden_dim,
+                        noise_dim=args.sdl_noise_dim,
+                        alpha=args.sdl_alpha,
+                        m_init=args.sdl_m_init,
+                    )
+                    for lvl in levels
+                }
+            )
+
+        self.sdl_points = args.sdl_points
+        if self.hierarchical and self.sdl_points == "down":
+            self.sdl = nn.ModuleList(
+                [make_level_noises() for _ in range(args.processor_layers)]
+            )
+        else:
+            self.sdl = nn.ModuleList([make_level_noises()])
+
+    def _apply_level_noise(self, level_noises, level, rep):
+        """Perturb rep (B, N_mesh[level], d_h) if level has an SDL"""
+        if (
+            level_noises is None
+            or self.sdl_scale == 0.0
+            or str(level) not in level_noises
+        ):
+            return rep
+        return level_noises[str(level)](rep, scale=self.sdl_scale)
+
     # ----------------------------------------------------------------------------
     @property
     def num_grid_connected_mesh_nodes(self):
@@ -629,6 +691,9 @@ class GraphDiff(ARModel):
             m2m_emb = self.m2m_embedder(self.m2m_features, emb)
             m2m_emb_expanded = self.expand_to_batch(m2m_emb, batch_size)
 
+            if self.sdl is not None:
+                mesh_rep = self._apply_level_noise(self.sdl[0], 0, mesh_rep)
+
             for gnn in self.processor_gnns:
                 mesh_rep, m2m_emb_expanded = gnn(
                     mesh_rep, mesh_rep, m2m_emb_expanded, emb
@@ -693,6 +758,12 @@ class GraphDiff(ARModel):
                 new_node_rep  # (B, num_mesh_nodes[l], d_h)
             )
             mesh_up_rep[level_l - 1] = new_edge_rep  # (B, M_up[l-1], d_h)
+
+        if self.sdl is not None and self.sdl_points == "init":
+            mesh_rep_levels = [
+                self._apply_level_noise(self.sdl[0], level_l, rep)
+                for level_l, rep in enumerate(mesh_rep_levels)
+            ]
 
         # - PROCESSOR -
         mesh_rep_levels, _, _, mesh_down_rep = self.hi_processor_step(
@@ -782,11 +853,19 @@ class GraphDiff(ARModel):
         down_gnns,
         same_gnns,
         emb,
+        level_noises=None,
     ):
         """
         Run down-part of vertical processing, sequentially alternating between
         processing using down edges and same-level edges.
+
+        level_noises: ModuleDict level -> StochasticLevelNoise of this
+            processor layer, or None
         """
+        mesh_rep_levels[-1] = self._apply_level_noise(
+            level_noises, self.num_levels - 1, mesh_rep_levels[-1]
+        )
+
         # Run same level processing on level L
         mesh_rep_levels[-1], mesh_same_rep[-1] = same_gnns[-1](
             mesh_rep_levels[-1], mesh_rep_levels[-1], mesh_same_rep[-1], emb
@@ -809,6 +888,9 @@ class GraphDiff(ARModel):
             # Apply down GNN
             new_node_rep, mesh_down_rep[level_l] = down_gnn(
                 send_node_rep, rec_node_rep, down_edge_rep, emb
+            )
+            new_node_rep = self._apply_level_noise(
+                level_noises, level_l, new_node_rep
             )
 
             # Run same level processing on level l
@@ -880,12 +962,21 @@ class GraphDiff(ARModel):
 
         Returns same lists
         """
-        for down_gnns, down_same_gnns, up_gnns, up_same_gnns in zip(
-            self.mesh_down_gnns,
-            self.mesh_down_same_gnns,
-            self.mesh_up_gnns,
-            self.mesh_up_same_gnns,
+        for layer_i, (down_gnns, down_same_gnns, up_gnns, up_same_gnns) in (
+            enumerate(
+                zip(
+                    self.mesh_down_gnns,
+                    self.mesh_down_same_gnns,
+                    self.mesh_up_gnns,
+                    self.mesh_up_same_gnns,
+                )
+            )
         ):
+            level_noises = (
+                self.sdl[layer_i]
+                if self.sdl is not None and self.sdl_points == "down"
+                else None
+            )
             # Down
             mesh_rep_levels, mesh_same_rep, mesh_down_rep = self.mesh_down_step(
                 mesh_rep_levels,
@@ -894,6 +985,7 @@ class GraphDiff(ARModel):
                 down_gnns,
                 down_same_gnns,
                 emb,
+                level_noises=level_noises,
             )
 
             # Up
@@ -908,6 +1000,41 @@ class GraphDiff(ARModel):
 
         # Note: We return all, even though only down edges really are used later
         return mesh_rep_levels, mesh_same_rep, mesh_up_rep, mesh_down_rep
+
+
+# ----------------------------------------------------------------------------
+class StochasticLevelNoise(nn.Module):
+    """
+    Stochastic decomposition layer (SDL, Schreck et al. 2025,
+    arXiv:2512.18815, Eq. 1) for the node representations of one mesh level:
+
+        F_out = F_in + scale * alpha * eps * S(z) * m
+
+    eps ~ N(0, I) of the shape of F_in (i.i.d. per node and channel),
+    z ~ N(0, I) a latent vector per sample, mapped to a per-channel scale S
+    by a learned linear layer, m a learned per-channel modulation and alpha a
+    fixed amplitude. Both eps and z are drawn fresh in every call (every
+    member and AR step), from the global RNG so that they are reproduced in
+    the gradient checkpointing recomputation.
+    """
+
+    def __init__(self, hidden_dim, noise_dim=32, alpha=0.235, m_init=1.0):
+        super().__init__()
+        self.noise_dim = noise_dim
+        self.alpha = alpha
+        self.proj = nn.Linear(noise_dim, hidden_dim)
+        self.m = nn.Parameter(torch.full((hidden_dim,), float(m_init)))
+
+    def forward(self, x, scale=1.0):
+        """
+        x: (B, N, d_h)
+        scale: multiplier of the perturbation (noise ramp)
+        """
+        z = torch.randn(
+            x.shape[0], self.noise_dim, device=x.device, dtype=x.dtype
+        )
+        channel_scale = (self.proj(z) * self.m).unsqueeze(1)  # (B, 1, d_h)
+        return x + (scale * self.alpha) * torch.randn_like(x) * channel_scale
 
 
 # ----------------------------------------------------------------------------

@@ -336,6 +336,106 @@ def main(input_args=None):
         help="Value for the noise parameter in the deterministisc version."
     )
 
+    # Graph-CRPS sources of stochasticity, see GraphCRPS
+    parser.add_argument(
+        "--stochasticity",
+        type=str,
+        nargs="*",
+        default=["fgn"],
+        choices=["fgn", "mc", "sdl"],
+        help="graph_crps sources of ensemble spread, any combination: fgn "
+        "(global noise vector in all conditional layer norms), mc (MC "
+        "dropout), sdl (noise on every mesh level, stochastic decomposition "
+        "layers) (default: fgn)",
+    )
+    parser.add_argument(
+        "--mc_dropout_p",
+        type=float,
+        default=0.1,
+        help="MC dropout rate of --stochasticity mc (default: 0.1)",
+    )
+    parser.add_argument(
+        "--mc_dropout_scope",
+        type=str,
+        default="processor",
+        choices=["processor", "mesh", "all"],
+        help="MLPs with MC dropout: processor (the hierarchical processor "
+        "GNNs), mesh (also mesh init and read-out GNNs), all (the whole "
+        "backbone) (default: processor)",
+    )
+    parser.add_argument(
+        "--sdl_alpha",
+        type=float,
+        default=0.235,
+        help="Fixed amplitude alpha of the SDL noise (default: 0.235)",
+    )
+    parser.add_argument(
+        "--sdl_noise_dim",
+        type=int,
+        default=32,
+        help="Dimension of the latent vector of each SDL (default: 32)",
+    )
+    parser.add_argument(
+        "--sdl_m_init",
+        type=float,
+        default=1.0,
+        help="Initial value of the learned per-channel SDL modulation m "
+        "(default: 1.0)",
+    )
+    parser.add_argument(
+        "--sdl_points",
+        type=str,
+        default="down",
+        choices=["down", "init"],
+        help="Where the SDL noise is injected: down (on every level in each "
+        "processor down sweep), init (once per level after mesh init) "
+        "(default: down)",
+    )
+    parser.add_argument(
+        "--sdl_levels",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Mesh levels (0 = finest) with SDL noise (default: all)",
+    )
+    parser.add_argument(
+        "--stoch_warmup_epochs",
+        type=float,
+        default=2,
+        help="graph_crps: epochs over which the noise of all sources is "
+        "ramped up from 0 (the deterministic model) to full strength, "
+        "counted from the start of the crps_finetune schedule (default: 2)",
+    )
+    parser.add_argument(
+        "--crps_epochs",
+        type=int,
+        default=25,
+        help="crps_finetune: epochs of single-step (ar=1) CRPS training, "
+        "including the noise ramp (default: 25)",
+    )
+    parser.add_argument(
+        "--crps_ar2_epochs",
+        type=int,
+        default=5,
+        help="crps_finetune: epochs of 2-step rollout CRPS training after "
+        "the ar=1 epochs, 0 to skip (default: 5)",
+    )
+    parser.add_argument(
+        "--crps_lr",
+        type=float,
+        default=1e-4,
+        help="crps_finetune: peak learning rate, warmed up from crps_lr/10 "
+        "over --warmup_epochs and cosine-annealed back to crps_lr/10 "
+        "(default: 1e-4)",
+    )
+    parser.add_argument(
+        "--freeze_backbone_epochs",
+        type=int,
+        default=0,
+        help="crps_finetune: first train only the SDL parameters for this "
+        "many epochs (needs --stochasticity sdl) (default: 0)",
+    )
+
     # Training options
     parser.add_argument(
         "--ar_steps_train",
@@ -498,6 +598,13 @@ def main(input_args=None):
         "(default: all)",
     )
     parser.add_argument(
+        "--limit_test_batches",
+        type=float,
+        default=None,
+        help="Limit the test batches (--eval), as --limit_train_batches, "
+        "e.g. 1 to only plot an example (default: all)",
+    )
+    parser.add_argument(
         "--grad_clip",
         type=float,
         default=None,
@@ -507,9 +614,10 @@ def main(input_args=None):
         "--warmup_epochs",
         type=int,
         default=None,
-        help="Linear LR warmup epochs of the flow_map_* schedulers "
-        "(default: 1 for flow_map_pretrain, 5 for flow_map_finetune, 2 for "
-        "flow_map_crps)",
+        help="Linear LR warmup epochs of the flow_map_* and crps_finetune "
+        "schedulers (default: 1 for flow_map_pretrain, 5 for "
+        "flow_map_finetune, 2 for flow_map_crps, --stoch_warmup_epochs "
+        "rounded up for crps_finetune)",
     )
     parser.add_argument(
         "--adaln_zero",
@@ -700,6 +808,8 @@ def main(input_args=None):
             "probabilistic",
             "deterministic",
             "finetune_deterministic",
+            "finetune_ar1",
+            "crps_finetune",
             *FLOW_MAP_SCHEDULERS,
         ],
         help="Multi-phase training scheduler. flow_map_pretrain (1 deg, "
@@ -708,8 +818,15 @@ def main(input_args=None):
         "rollouts, --fmap_objective crps or map+crps) are the three parts "
         "of the FlowMap schedule, each its own run with --load set to the "
         "checkpoint of the previous part. --epochs is the length of the "
-        "part. Re-running a part with --load set to its own checkpoint "
-        "resumes or extends it (to --epochs in total).",
+        "part. finetune_ar1: the LR schedule of finetune_deterministic "
+        "(60 epochs after a 175-epoch pretraining) but all 60 epochs at "
+        "ar=1, for models whose AR training is too expensive (FM). "
+        "Re-running a part with --load set to its own checkpoint "
+        "resumes or extends it (to --epochs in total). crps_finetune: "
+        "probabilistic fine-tuning of graph_crps from a (graph_det) "
+        "checkpoint given with --load, --crps_epochs at ar=1 (noise ramped "
+        "up over --stoch_warmup_epochs) then --crps_ar2_epochs at ar=2, see "
+        "training_scripts/graph_crps/README.md.",
     )
     add_flow_map_args(parser)
 
@@ -775,6 +892,7 @@ def main(input_args=None):
         use_atmosphere_g2m=args.use_atmosphere_g2m,
         density_channel=getattr(config.training, "density_channel", None),
         train_distr_crps=args.train_distr_crps,
+        seed=args.seed,
     )
 
     # Instantiate model + trainer
@@ -812,8 +930,12 @@ def main(input_args=None):
         prefix = f"eval-{args.eval}-"
     else:
         prefix = "train-"
+    # graph_crps runs are named by their noise sources, e.g. graph_crps_fgn
+    model_name = args.model
+    if args.model == "graph_crps" and args.stochasticity:
+        model_name += "_" + "_".join(args.stochasticity)
     run_name = (
-        f"{prefix}{args.model}-{args.processor_layers}x{args.hidden_dim}-"
+        f"{prefix}{model_name}-{args.processor_layers}x{args.hidden_dim}-"
         f"{time.strftime('%m_%d_%H')}-{random_run_id:04d}"
     )
 
@@ -831,6 +953,17 @@ def main(input_args=None):
             mode="min",
         )
     )
+    if args.model == "graph_crps":
+        # val_mean_loss is the loss of a single ensemble member, which
+        # favours low spread. Also keep the best ensemble CRPS.
+        callbacks.append(
+            pl.callbacks.ModelCheckpoint(
+                dirpath=f"saved_models/{run_name}",
+                filename="min_val_crps",
+                monitor="val_mean_ens_crps",
+                mode="min",
+            )
+        )
     # Separate callback that keeps "last.ckpt" up to date after *every* epoch.
     # A monitored ModelCheckpoint only saves when validation runs, so with
     # --val_interval > 1 (check_val_every_n_epoch != 1, which also makes
@@ -875,6 +1008,7 @@ def main(input_args=None):
             gradient_clip_algorithm="norm",
             limit_train_batches=_limit_batches(args.limit_train_batches),
             limit_val_batches=_limit_batches(args.limit_val_batches),
+            limit_test_batches=_limit_batches(args.limit_test_batches),
             num_sanity_val_steps=args.num_sanity_val_steps,
             use_distributed_sampler=not args.train_distr_crps,
         )
@@ -972,6 +1106,173 @@ def main(input_args=None):
         """
         data_module.ar_steps_train = n_steps
         model.grad_checkpointing = args.grad_checkpointing or n_steps > 1
+
+    def _run_crps_finetune():
+        """Probabilistic (CRPS) fine-tuning of graph_crps, typically from a
+        graph_det checkpoint given with --load.
+
+        Phases, counted from the epoch after the --load checkpoint:
+        (0. --freeze_backbone_epochs at ar=1, only the SDL parameters
+            trained)
+        1. --crps_epochs at ar=1. The noise of all sources is ramped up from 0
+           (= the deterministic model) over the first --stoch_warmup_epochs,
+           while the LR warms up from crps_lr/10 to crps_lr.
+        2. --crps_ar2_epochs at ar=2 (gradient checkpointing on).
+        The LR is cosine-annealed from crps_lr to crps_lr/10 over all phases.
+
+        --load from a checkpoint of another scheduler (e.g. graph_det from
+        finetune_deterministic) starts the fine-tuning after its last epoch,
+        with a fresh optimizer. --load from a crps_finetune checkpoint
+        resumes it (optimizer and LR schedule restored), also within the
+        noise ramp; a larger --crps_epochs then extends phase 1, as long as
+        phase 2 has not started.
+        """
+        assert args.model == "graph_crps", (
+            "--scheduler crps_finetune is for --model graph_crps"
+        )
+        if args.freeze_backbone_epochs > 0:
+            assert "sdl" in model.stochasticity, (
+                "--freeze_backbone_epochs needs --stochasticity sdl, it only "
+                "trains the SDL parameters"
+            )
+
+        start_epoch, same_part = 0, False
+        if args.load:
+            ckpt = torch.load(
+                args.load, map_location="cpu", mmap=True, weights_only=False
+            )
+            loaded_args = ckpt.get("hyper_parameters", {}).get("args")
+            same_part = (
+                getattr(loaded_args, "scheduler", None) == "crps_finetune"
+            )
+            done = _completed_epochs(args.load)
+            if same_part:
+                start_epoch = ckpt.get("crps_stage_start_epoch", 0)
+            else:
+                start_epoch = done
+            del ckpt
+            print(
+                f"[crps_finetune] --load {args.load}: "
+                + (
+                    f"resuming (started at epoch {start_epoch}, "
+                    f"{done - start_epoch} epoch(s) done)"
+                    if same_part
+                    else f"starting CRPS fine-tuning after epoch {done}, "
+                    "with a fresh optimizer"
+                )
+            )
+        # Keep the optimizer and LR schedule only within the fine-tuning
+        model.restore_opt = same_part
+        model.crps_stage_start_epoch = start_epoch
+
+        warmup_epochs = (
+            args.warmup_epochs
+            if args.warmup_epochs is not None
+            else int(np.ceil(args.stoch_warmup_epochs))
+        )
+        warmup_epochs = max(warmup_epochs, 1)
+        total_epochs = (
+            args.freeze_backbone_epochs
+            + args.crps_epochs
+            + args.crps_ar2_epochs
+        )
+        # Per-epoch LR factor (epochs since the start of the fine-tuning,
+        # restored with the scheduler state on resume): linear warmup from
+        # 1/10 to 1, then cosine back to 1/10 at the end. A LambdaLR built
+        # from the current flags (rather than a SequentialLR, which stores
+        # T_max in its state), so that extending the run re-stretches the
+        # cosine instead of letting the LR rise again after the old end.
+        lr_floor = 0.1
+
+        def _lr_factor(epoch):
+            if epoch < warmup_epochs:
+                return lr_floor + (1 - lr_floor) * epoch / warmup_epochs
+            progress = min(
+                (epoch - warmup_epochs)
+                / max(total_epochs - warmup_epochs, 1),
+                1.0,
+            )
+            return lr_floor + (1 - lr_floor) * 0.5 * (
+                1 + np.cos(np.pi * progress)
+            )
+
+        _orig_configure = model.configure_optimizers
+
+        def configure_optimizers_crps(self_ref=model):
+            opt = _orig_configure()
+            optimizer = opt["optimizer"] if isinstance(opt, dict) else opt
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = args.crps_lr
+                param_group["initial_lr"] = args.crps_lr
+            sched = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_factor)
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {"scheduler": sched, "interval": "epoch"},
+            }
+
+        model.configure_optimizers = configure_optimizers_crps
+
+        def _freeze_phase():
+            model.freeze_backbone = True
+            _set_ar_steps(1)
+
+        def _ar1_phase():
+            model.freeze_backbone = False
+            _set_ar_steps(1)
+
+        def _ar2_phase():
+            model.freeze_backbone = False
+            _set_ar_steps(2)
+
+        phases = []
+        end = start_epoch
+        if args.freeze_backbone_epochs > 0:
+            end += args.freeze_backbone_epochs
+            phases.append(
+                (
+                    f"Phase 0: {args.freeze_backbone_epochs} ep, ar=1, only "
+                    "SDL parameters",
+                    end,
+                    _freeze_phase,
+                )
+            )
+        end += args.crps_epochs
+        phases.append(
+            (
+                f"Phase 1: {args.crps_epochs} ep, ar=1 (noise ramp over "
+                f"{args.stoch_warmup_epochs} ep)",
+                end,
+                _ar1_phase,
+            )
+        )
+        if args.crps_ar2_epochs > 0:
+            end += args.crps_ar2_epochs
+            phases.append(
+                (f"Phase 2: {args.crps_ar2_epochs} ep, ar=2", end, _ar2_phase)
+            )
+        print(
+            f"[crps_finetune] epochs {start_epoch} -> {end}, stochasticity "
+            f"{sorted(model.stochasticity)}, lr {args.crps_lr / 10} -> "
+            f"{args.crps_lr} -> {args.crps_lr / 10} (warmup {warmup_epochs} "
+            f"ep), distributed CRPS: {args.train_distr_crps}"
+        )
+
+        ckpt_path = args.load
+        done = _completed_epochs(ckpt_path)
+        for label, max_epochs, setup in phases:
+            setup()
+            if done >= max_epochs:
+                print(f"[crps_finetune] {label} -- already done, skipping")
+                continue
+            print(f"[crps_finetune] {label}")
+            new_ckpt = _run_phase(
+                model, data_module, max_epochs, "ddp", ckpt_path=ckpt_path
+            )
+            ckpt_path = new_ckpt or ckpt_path
+            done = max(done, max_epochs)
+            # Later phases continue from this run's checkpoint: keep its
+            # optimizer state and LR schedule
+            model.restore_opt = True
 
     def _add_cosine_lr(model, max_epochs):
         """Attach a CosineAnnealingLR scheduler to the model."""
@@ -1211,7 +1512,7 @@ def main(input_args=None):
             ]
         )
 
-    elif args.scheduler == "finetune_deterministic":
+    elif args.scheduler in ("finetune_deterministic", "finetune_ar1"):
         prior_done = 175
         _add_finetune_sequential_lr(
             model,
@@ -1228,22 +1529,39 @@ def main(input_args=None):
         def _ft_det_p2():
             _set_ar_steps(2)
 
-        _run_phases(
-            [
-                (
-                    "Phase 1/2: 50 ep, ar=1",
-                    prior_done + 50,
-                    _ft_det_p1,
-                    "ddp",
-                ),
-                (
-                    "Phase 2/2: 10 ep, ar=2",
-                    prior_done + 60,
-                    _ft_det_p2,
-                    "ddp",
-                ),
-            ]
-        )
+        if args.scheduler == "finetune_ar1":
+            # Same length and LR schedule, but no ar=2 phase. Same DDP
+            # strategy as the default single-phase training of FM.
+            _run_phases(
+                [
+                    (
+                        "Phase 1/1: 60 ep, ar=1",
+                        prior_done + 60,
+                        _ft_det_p1,
+                        "ddp_find_unused_parameters_true",
+                    )
+                ]
+            )
+        else:
+            _run_phases(
+                [
+                    (
+                        "Phase 1/2: 50 ep, ar=1",
+                        prior_done + 50,
+                        _ft_det_p1,
+                        "ddp",
+                    ),
+                    (
+                        "Phase 2/2: 10 ep, ar=2",
+                        prior_done + 60,
+                        _ft_det_p2,
+                        "ddp",
+                    ),
+                ]
+            )
+
+    elif args.scheduler == "crps_finetune":
+        _run_crps_finetune()
 
     elif args.scheduler in FLOW_MAP_SCHEDULERS:
         assert args.model == "FlowMap", (

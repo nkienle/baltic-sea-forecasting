@@ -27,6 +27,9 @@ wandb online
 #   sbatch training_scripts/train.sh training_scripts/seacast/seacast_pretrain_soap_muon.sh
 #   sbatch training_scripts/train.sh training_scripts/graph_flow_map/flow_map_pretrain.sh
 #   sbatch training_scripts/train.sh training_scripts/graph_flow/fm_positional.sh
+#   sbatch training_scripts/train.sh training_scripts/graph_flow/fm_positional_finetune.sh
+#   sbatch training_scripts/train.sh training_scripts/graph_crps/seacast_crps_mc.sh
+#       (probabilistic fine-tuning, see training_scripts/graph_crps/README.md)
 # With no arguments the default below is used.
 #
 # Alternatives:

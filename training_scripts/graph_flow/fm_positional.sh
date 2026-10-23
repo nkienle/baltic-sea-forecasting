@@ -2,6 +2,11 @@
 # a teacher for the FlowMap (--fmap_teacher_ckpt, --fmap_init_from_teacher,
 # --fmap_offdiag_target teacher). Same backbone settings as the FlowMap scripts.
 #   sbatch training_scripts/train.sh training_scripts/graph_flow/fm_positional.sh
+# Finished: train-FM-3x1024-10_19_13-2281 (job 159495, 175/175 epochs, a resume
+# of 10_14_13-2630). It is continued at 1/4 deg by fm_positional_finetune.sh.
+# Remove --load / --restore_opt below to start from scratch.
+RESUME_CKPT="/proj/berzelius-2022-164/users/x_erila/baltic-sea-forecasting/saved_models/train-FM-3x1024-10_19_13-2281/last.ckpt"
+
 srun python -m neural_lam.train_model \
     --config_path data/global_ocean_1_density.yaml \
     --num_workers 2 \
@@ -31,4 +36,6 @@ srun python -m neural_lam.train_model \
     --num_sanity_val_steps 0 \
     --num_nodes 1 \
     --optimizer "muon_flat" \
+    --load "$RESUME_CKPT" \
+    --restore_opt \
     "$@"

@@ -347,6 +347,19 @@ def set_adaln_zero(module, init=True):
     return module
 
 
+def set_mc_dropout(module, p):
+    """
+    Set the MC dropout rate of every MLP / CondMLP in module (0 turns it
+    off). The dropout is applied functionally in forward, so the parameter
+    layout, and thereby checkpoint compatibility, is unchanged.
+    Returns the list of MLPs that were changed.
+    """
+    mlps = [m for m in module.modules() if isinstance(m, (MLP, CondMLP))]
+    for m in mlps:
+        m.mc_dropout_p = float(p)
+    return mlps
+
+
 def _mlp_layers(blueprint):
     """
     Build the Linear/SiLU stack of an MLP from a list blueprint.
@@ -363,6 +376,24 @@ def _mlp_layers(blueprint):
     return layers
 
 
+def _forward_mc_dropout(layers, x, p):
+    """
+    Run a Linear/SiLU stack with dropout on the input of its last Linear,
+    i.e. on the hidden features inside the (residual) MLP, as in the U-Cast
+    ResBlocks. Dropout is always active (MC dropout), also in eval mode.
+    MLPs without a hidden layer are run without dropout, as that would drop
+    input features.
+    """
+    last_linear = max(
+        i for i, layer in enumerate(layers) if isinstance(layer, nn.Linear)
+    )
+    for i, layer in enumerate(layers):
+        if i == last_linear and i > 0:
+            x = nn.functional.dropout(x, p=p, training=True)
+        x = layer(x)
+    return x
+
+
 class MLP(nn.Sequential):
     """
     Plain MLP, optionally with a LayerNorm on the output.
@@ -377,6 +408,8 @@ class MLP(nn.Sequential):
         if layer_norm:
             layers.append(nn.LayerNorm(blueprint[-1]))
         super().__init__(*layers)
+        # MC dropout rate, see set_mc_dropout
+        self.mc_dropout_p = 0.0
 
     # pylint: disable-next=arguments-differ
     def forward(self, x, emb=None):
@@ -384,6 +417,8 @@ class MLP(nn.Sequential):
         x: (..., blueprint[0])
         emb: unused, present for call-compatibility with CondMLP
         """
+        if self.mc_dropout_p > 0.0:
+            return _forward_mc_dropout(self, x, self.mc_dropout_p)
         return super().forward(x)
 
 
@@ -403,13 +438,18 @@ class CondMLP(nn.Module):
             self.layer_norm = ConditionalLayerNorm(blueprint[-1], cond_dim)
         else:
             self.layer_norm = None
+        # MC dropout rate, see set_mc_dropout
+        self.mc_dropout_p = 0.0
 
     def forward(self, x, emb=None):
         """
         x: (..., blueprint[0])
         emb: (..., cond_dim), conditioning embedding
         """
-        x = self.mlp_layers(x)
+        if self.mc_dropout_p > 0.0:
+            x = _forward_mc_dropout(self.mlp_layers, x, self.mc_dropout_p)
+        else:
+            x = self.mlp_layers(x)
 
         if self.layer_norm is not None:
             x = self.layer_norm(x, emb)

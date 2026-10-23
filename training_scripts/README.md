@@ -136,6 +136,19 @@ global_cluster_1_4_deg_15_refinement_4_levels
 global_cluster_1_4_deg_10_refinement_4_levels
 ```
 
+## Probabilistic fine-tuning
+
+[`graph_crps/README.md`](graph_crps/README.md) — CRPS fine-tuning of the 1/4°
+`graph_det` model into an ensemble model, with FGN noise, MC dropout and/or
+per-level noise (`--stochasticity`), in distributed, checkpointed or single-GPU
+mode, and how many epochs to run.
+
+```sh
+sbatch training_scripts/train.sh training_scripts/graph_crps/seacast_crps_fgn.sh
+sbatch training_scripts/train.sh training_scripts/graph_crps/seacast_crps_mc.sh
+sbatch training_scripts/train.sh training_scripts/graph_crps/seacast_crps_sdl.sh
+```
+
 ## Notes
 
 - `train.sh` requests 8 GPUs on 1 node for 72 hours. Change the `#SBATCH` header there

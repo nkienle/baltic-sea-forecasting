@@ -2,7 +2,7 @@ srun python -m neural_lam.train_model \
     --config_path data/global_ocean_1_4_density.yaml \
     --num_workers 2 \
     --precision bf16-mixed \
-    --model crps \
+    --model graph_crps \
     --graph global_cluster_1_4_deg_20_refinement_4_levels \
     --hidden_dim 256 \
     --hidden_dim_grid 128 \
